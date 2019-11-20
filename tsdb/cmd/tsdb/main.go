@@ -15,6 +15,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb"
@@ -64,9 +66,13 @@ func execute() (err error) {
 		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
+		dumpFormat           = dumpCmd.Flag("format", "output format").Default("stdout").String()
 		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
 		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
 		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
+		dumpLabelName        = dumpCmd.Flag("label-name", "label name").String()
+		dumpLabelValue       = dumpCmd.Flag("label-value", "label value").String()
+		dumpSourceName       = dumpCmd.Flag("source-name", "path to sqlite3 db file").Default("./sqlite3.db").String()
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -126,6 +132,16 @@ func execute() (err error) {
 		}
 		return analyzeBlock(block, *analyzeLimit)
 	case dumpCmd.FullCommand():
+		cfg := &dumpConfiguration{
+			format:     *dumpFormat,
+			labelName:  *dumpLabelName,
+			labelValue: *dumpLabelValue,
+			maxTime:    *dumpMaxTime,
+			minTime:    *dumpMinTime,
+			path:       *dumpPath,
+			sourceName: *dumpSourceName,
+		}
+
 		db, err := tsdb.OpenDBReadOnly(*dumpPath, nil)
 		if err != nil {
 			return err
@@ -135,7 +151,7 @@ func execute() (err error) {
 			merr.Add(db.Close())
 			err = merr.Err()
 		}()
-		return dumpSamples(db, *dumpMinTime, *dumpMaxTime)
+		return dumpSamples(db, cfg)
 	}
 	return nil
 }
@@ -603,9 +619,34 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 	return nil
 }
 
-func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
+type dumpConfiguration struct {
+	format     string
+	labelName  string
+	labelValue string
+	maxTime    int64
+	minTime    int64
+	path       string
+	sourceName string
+}
 
-	q, err := db.Querier(mint, maxt)
+func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+	switch cfg.format {
+	case "stdout":
+		if err := dumpSamplesStdout(db, cfg); err != nil {
+			return err
+		}
+	case "sqlite3":
+		if err := dumpSamplesSqlite3(db, cfg); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown format %s", cfg.format)
+	}
+	return nil
+}
+
+func dumpSamplesStdout(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+	q, err := db.Querier(cfg.minTime, cfg.maxTime)
 	if err != nil {
 		return err
 	}
@@ -616,7 +657,14 @@ func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 		err = merr.Err()
 	}()
 
-	ss, err := q.Select(labels.MustNewMatcher(labels.MatchRegexp, "", ".*"))
+	var matcher labels.Matcher
+	if cfg.labelName != "" && cfg.labelValue != "" {
+		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
+	} else {
+		matcher = labels.MustNewMatcher(labels.MatchRegexp, "", ".*")
+	}
+
+	ss, err := q.Select(matcher)
 	if err != nil {
 		return err
 	}
@@ -624,6 +672,7 @@ func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 	for ss.Next() {
 		series := ss.At()
 		labels := series.Labels()
+
 		it := series.Iterator()
 		for it.Next() {
 			ts, val := it.At()
@@ -637,5 +686,109 @@ func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 	if ss.Err() != nil {
 		return ss.Err()
 	}
+	return nil
+}
+
+// go run cmd/tsdb/main.go dump ../../snapshots/snapshots/20191017T205052Z-32c83bebdee150eb --label-name=__name__ --label-value=etcd_disk_wal_fsync_duration_seconds_sum --format=sqlite3
+func dumpSamplesSqlite3(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+	dbSqlite3, err := sql.Open("sqlite3", cfg.sourceName)
+	if err != nil {
+		return err
+	}
+	defer dbSqlite3.Close()
+
+	sqlStmt := `
+	CREATE TABLE IF NOT EXISTS labels (
+	  id INTEGER PRIMARY KEY,
+	  labels TEXT NOT NULL,
+	  UNIQUE(labels) ON CONFLICT IGNORE
+	);
+	`
+	_, err = dbSqlite3.Exec(sqlStmt)
+	if err != nil {
+		return fmt.Errorf("error creating labels table: %v", err)
+	}
+
+	sqlStmt = `
+	CREATE TABLE IF NOT EXISTS data (
+	  label_id INTEGER NOT NULL,
+	  timestamp INTEGER NOT NULL,
+	  value REAL NOT NULL,
+	  FOREIGN KEY(label_id) REFERENCES labels(id)
+	);
+	`
+	_, err = dbSqlite3.Exec(sqlStmt)
+	if err != nil {
+		return fmt.Errorf("error creating data table: %v", err)
+	}
+
+	tx, err := dbSqlite3.Begin()
+	if err != nil {
+		return fmt.Errorf("error beginning transaction: %v", err)
+	}
+	stmt, err := tx.Prepare("INSERT INTO labels(labels) values(?)")
+	if err != nil {
+		return fmt.Errorf("error preparing transaction: %v", err)
+	}
+	defer stmt.Close()
+
+	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = ?), ?, ?);")
+	if err != nil {
+		return fmt.Errorf("error preparing transaction: %v", err)
+	}
+	defer stmtData.Close()
+
+	q, err := db.Querier(cfg.minTime, cfg.maxTime)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		var merr tsdb_errors.MultiError
+		merr.Add(err)
+		merr.Add(q.Close())
+		err = merr.Err()
+	}()
+
+	var matcher labels.Matcher
+	if cfg.labelName != "" && cfg.labelValue != "" {
+		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
+	} else {
+		matcher = labels.NewMustRegexpMatcher("", ".*")
+	}
+
+	ss, err := q.Select(matcher)
+	if err != nil {
+		return err
+	}
+
+	for ss.Next() {
+		series := ss.At()
+		labels := series.Labels()
+
+		it := series.Iterator()
+		for it.Next() {
+			ts, val := it.At()
+			//fmt.Printf("%s %g %d\n", labels, val, ts)
+			_, err := stmt.Exec(labels.String())
+			if err != nil {
+				return fmt.Errorf("error inserting into labels table: %v", err)
+			}
+			//labelID, _ := stmtOutput
+			_, err = stmtData.Exec(labels.String(), ts, val)
+			if err != nil {
+				return fmt.Errorf("error inserting into data table: %v", err)
+			}
+		}
+		if it.Err() != nil {
+			return ss.Err()
+		}
+	}
+
+	if ss.Err() != nil {
+		return ss.Err()
+	}
+
+	tx.Commit()
+
 	return nil
 }

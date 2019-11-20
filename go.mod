@@ -23,6 +23,7 @@ require (
 	github.com/influxdata/influxdb v1.7.7
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.7
+	github.com/mattn/go-sqlite3 v1.13.0 // indirect
 	github.com/miekg/dns v1.1.15
 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f
 	github.com/oklog/run v1.0.0
