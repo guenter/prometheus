@@ -72,7 +72,7 @@ func execute() (err error) {
 		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
 		dumpLabelName        = dumpCmd.Flag("label-name", "label name").String()
 		dumpLabelValue       = dumpCmd.Flag("label-value", "label value").String()
-		dumpSourceName       = dumpCmd.Flag("source-name", "path to sqlite3 db file").Default("./sqlite3.db").String()
+		dumpOutputFile       = dumpCmd.Flag("output-file", "path to sqlite3 db output file").Default("./sqlite3.db").String()
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -139,7 +139,7 @@ func execute() (err error) {
 			maxTime:    *dumpMaxTime,
 			minTime:    *dumpMinTime,
 			path:       *dumpPath,
-			sourceName: *dumpSourceName,
+			outputFile: *dumpOutputFile,
 		}
 
 		db, err := tsdb.OpenDBReadOnly(*dumpPath, nil)
@@ -626,7 +626,7 @@ type dumpConfiguration struct {
 	maxTime    int64
 	minTime    int64
 	path       string
-	sourceName string
+	outputFile string
 }
 
 func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
@@ -691,7 +691,7 @@ func dumpSamplesStdout(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) 
 
 // go run cmd/tsdb/main.go dump ../../snapshots/snapshots/20191017T205052Z-32c83bebdee150eb --label-name=__name__ --label-value=etcd_disk_wal_fsync_duration_seconds_sum --format=sqlite3
 func dumpSamplesSqlite3(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
-	dbSqlite3, err := sql.Open("sqlite3", cfg.sourceName)
+	dbSqlite3, err := sql.Open("sqlite3", cfg.outputFile)
 	if err != nil {
 		return err
 	}
