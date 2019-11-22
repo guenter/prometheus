@@ -728,13 +728,13 @@ func dumpSamplesSqlite3(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error)
 	}
 	stmt, err := tx.Prepare("INSERT INTO labels(labels) values(?)")
 	if err != nil {
-		return fmt.Errorf("error preparing transaction: %v", err)
+		return fmt.Errorf("error preparing statement: %v", err)
 	}
 	defer stmt.Close()
 
 	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = ?), ?, ?);")
 	if err != nil {
-		return fmt.Errorf("error preparing transaction: %v", err)
+		return fmt.Errorf("error preparing statement: %v", err)
 	}
 	defer stmtData.Close()
 
