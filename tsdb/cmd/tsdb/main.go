@@ -16,6 +16,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -66,13 +68,18 @@ func execute() (err error) {
 		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
+		dumpDBName           = dumpCmd.Flag("dbname", "postgres database name").Default("tsdb").String()
 		dumpFormat           = dumpCmd.Flag("format", "output format").Default("stdout").String()
-		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
+		dumpHost             = dumpCmd.Flag("host", "postgres host").Default("localhost").String()
 		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
 		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
 		dumpLabelName        = dumpCmd.Flag("label-name", "label name").String()
 		dumpLabelValue       = dumpCmd.Flag("label-value", "label value").String()
 		dumpOutputFile       = dumpCmd.Flag("output-file", "path to sqlite3 db output file").Default("./sqlite3.db").String()
+		dumpPassword         = dumpCmd.Flag("password", "postgres user password").Default("pgpassword").String()
+		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
+		dumpPort             = dumpCmd.Flag("port", "postgres port").Default("5432").Int()
+		dumpUser             = dumpCmd.Flag("user", "postgres user").Default("pguser").String()
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -133,13 +140,18 @@ func execute() (err error) {
 		return analyzeBlock(block, *analyzeLimit)
 	case dumpCmd.FullCommand():
 		cfg := &dumpConfiguration{
+			dbname:     *dumpDBName,
 			format:     *dumpFormat,
+			host:       *dumpHost,
 			labelName:  *dumpLabelName,
 			labelValue: *dumpLabelValue,
 			maxTime:    *dumpMaxTime,
 			minTime:    *dumpMinTime,
-			path:       *dumpPath,
 			outputFile: *dumpOutputFile,
+			password:   *dumpPassword,
+			path:       *dumpPath,
+			port:       *dumpPort,
+			user:       *dumpUser,
 		}
 
 		db, err := tsdb.OpenDBReadOnly(*dumpPath, nil)
@@ -620,17 +632,26 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 }
 
 type dumpConfiguration struct {
+	dbname     string
 	format     string
+	host       string
 	labelName  string
 	labelValue string
 	maxTime    int64
 	minTime    int64
-	path       string
 	outputFile string
+	password   string
+	path       string
+	port       int
+	user       string
 }
 
 func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 	switch cfg.format {
+	case "postgres":
+		if err := dumpSamplesPostgres(db, cfg); err != nil {
+			return err
+		}
 	case "stdout":
 		if err := dumpSamplesStdout(db, cfg); err != nil {
 			return err
@@ -642,6 +663,91 @@ func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 	default:
 		return fmt.Errorf("unknown format %s", cfg.format)
 	}
+	return nil
+}
+
+func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require", cfg.host, cfg.port,
+		cfg.user, cfg.password, cfg.dbname)
+	dbPsql, err := sql.Open("postgres", psqlInfo)
+	if err != nil {
+		return err
+	}
+	defer dbPsql.Close()
+
+	tx, err := dbPsql.Begin()
+	if err != nil {
+		return fmt.Errorf("error beginning transaction: %v", err)
+	}
+	stmt, err := tx.Prepare("INSERT INTO labels(labels) values($1::jsonb) ON CONFLICT (labels) DO NOTHING")
+	if err != nil {
+		return fmt.Errorf("error preparing labels statement: %v", err)
+	}
+	defer stmt.Close()
+
+	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = $1), to_timestamp($2), $3);")
+	if err != nil {
+		return fmt.Errorf("error preparing data statement: %v", err)
+	}
+	defer stmtData.Close()
+
+	q, err := db.Querier(cfg.minTime, cfg.maxTime)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		var merr tsdb_errors.MultiError
+		merr.Add(err)
+		merr.Add(q.Close())
+		err = merr.Err()
+	}()
+
+	var matcher labels.Matcher
+	if cfg.labelName != "" && cfg.labelValue != "" {
+		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
+	} else {
+		matcher = labels.NewMustRegexpMatcher("", ".*")
+	}
+
+	ss, err := q.Select(matcher)
+	if err != nil {
+		return err
+	}
+
+	for ss.Next() {
+		series := ss.At()
+		labels := series.Labels()
+		labelMap := labels.Map()
+		jLabel, err := json.Marshal(labelMap)
+		if err != nil {
+			return fmt.Errorf("error marshalling label map: %v", err)
+		}
+		it := series.Iterator()
+		for it.Next() {
+			ts, val := it.At()
+			_, err := stmt.Exec(jLabel)
+			if err != nil {
+				return fmt.Errorf("error inserting into labels table: %v", err)
+			}
+			_, err = stmtData.Exec(jLabel, ts, val)
+			if err != nil {
+				return fmt.Errorf("error inserting into data table: %v", err)
+			}
+		}
+		if it.Err() != nil {
+			return ss.Err()
+		}
+	}
+
+	if ss.Err() != nil {
+		return ss.Err()
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
