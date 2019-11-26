@@ -685,7 +685,7 @@ func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error
 	}
 	defer stmt.Close()
 
-	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = $1), to_timestamp($2), $3);")
+	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = $1), to_timestamp($2::double precision / 1000), $3);")
 	if err != nil {
 		return fmt.Errorf("error preparing data statement: %v", err)
 	}
