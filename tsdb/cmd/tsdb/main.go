@@ -68,6 +68,7 @@ func execute() (err error) {
 		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
+		dumpClusterName      = dumpCmd.Flag("cluster-name", "name of cluster").Default("N/A").String()
 		dumpDBName           = dumpCmd.Flag("dbname", "postgres database name").Default("tsdb").String()
 		dumpFormat           = dumpCmd.Flag("format", "output format").Default("stdout").String()
 		dumpHost             = dumpCmd.Flag("host", "postgres host").Default("localhost").String()
@@ -140,18 +141,19 @@ func execute() (err error) {
 		return analyzeBlock(block, *analyzeLimit)
 	case dumpCmd.FullCommand():
 		cfg := &dumpConfiguration{
-			dbname:     *dumpDBName,
-			format:     *dumpFormat,
-			host:       *dumpHost,
-			labelName:  *dumpLabelName,
-			labelValue: *dumpLabelValue,
-			maxTime:    *dumpMaxTime,
-			minTime:    *dumpMinTime,
-			outputFile: *dumpOutputFile,
-			password:   *dumpPassword,
-			path:       *dumpPath,
-			port:       *dumpPort,
-			user:       *dumpUser,
+			clusterName: *dumpClusterName,
+			dbname:      *dumpDBName,
+			format:      *dumpFormat,
+			host:        *dumpHost,
+			labelName:   *dumpLabelName,
+			labelValue:  *dumpLabelValue,
+			maxTime:     *dumpMaxTime,
+			minTime:     *dumpMinTime,
+			outputFile:  *dumpOutputFile,
+			password:    *dumpPassword,
+			path:        *dumpPath,
+			port:        *dumpPort,
+			user:        *dumpUser,
 		}
 
 		db, err := tsdb.OpenDBReadOnly(*dumpPath, nil)
@@ -632,18 +634,19 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 }
 
 type dumpConfiguration struct {
-	dbname     string
-	format     string
-	host       string
-	labelName  string
-	labelValue string
-	maxTime    int64
-	minTime    int64
-	outputFile string
-	password   string
-	path       string
-	port       int
-	user       string
+	clusterName string
+	dbname      string
+	format      string
+	host        string
+	labelName   string
+	labelValue  string
+	maxTime     int64
+	minTime     int64
+	outputFile  string
+	password    string
+	path        string
+	port        int
+	user        string
 }
 
 func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
@@ -679,7 +682,7 @@ func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error
 	if err != nil {
 		return fmt.Errorf("error beginning transaction: %v", err)
 	}
-	stmt, err := tx.Prepare("INSERT INTO labels(labels) values($1::jsonb) ON CONFLICT (labels) DO NOTHING")
+	stmt, err := tx.Prepare("INSERT INTO labels(cluster_name, labels) values($1, $2::jsonb) ON CONFLICT (cluster_name, labels) DO NOTHING")
 	if err != nil {
 		return fmt.Errorf("error preparing labels statement: %v", err)
 	}
@@ -725,7 +728,7 @@ func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error
 		it := series.Iterator()
 		for it.Next() {
 			ts, val := it.At()
-			_, err := stmt.Exec(jLabel)
+			_, err := stmt.Exec(cfg.clusterName, jLabel)
 			if err != nil {
 				return fmt.Errorf("error inserting into labels table: %v", err)
 			}
