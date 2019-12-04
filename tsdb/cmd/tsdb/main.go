@@ -68,6 +68,7 @@ func execute() (err error) {
 		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
+		dumpAll              = dumpCmd.Flag("all", "dump all metrics").Short('a').Bool()
 		dumpClusterName      = dumpCmd.Flag("cluster-name", "name of cluster").Default("N/A").String()
 		dumpDBName           = dumpCmd.Flag("dbname", "postgres database name").Default("tsdb").String()
 		dumpFormat           = dumpCmd.Flag("format", "output format").Default("stdout").String()
@@ -141,6 +142,7 @@ func execute() (err error) {
 		return analyzeBlock(block, *analyzeLimit)
 	case dumpCmd.FullCommand():
 		cfg := &dumpConfiguration{
+			all:         *dumpAll,
 			clusterName: *dumpClusterName,
 			dbname:      *dumpDBName,
 			format:      *dumpFormat,
@@ -634,6 +636,7 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 }
 
 type dumpConfiguration struct {
+	all         bool
 	clusterName string
 	dbname      string
 	format      string
@@ -669,7 +672,61 @@ func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 	return nil
 }
 
-func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) error {
+	if cfg.all {
+		return dumpSamplesPostgresAll(db, cfg)
+	} else {
+		return dumpSamplesPostgresIndividual(db, cfg)
+	}
+	return nil
+}
+
+func dumpSamplesPostgresAll(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+	q, err := db.Querier(cfg.minTime, cfg.maxTime)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	existingMetrics, err := q.LabelValues("__name__")
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found %d metrics\n", len(existingMetrics))
+
+	var wg sync.WaitGroup
+
+	jobs := make(chan string, len(existingMetrics))
+
+	for i := 1; i <= 5; i++ {
+		go dumpSamplesPostgresWorker(i, jobs, db, cfg, &wg)
+	}
+
+	for _, j := range existingMetrics {
+		wg.Add(1)
+		jobs <- j
+	}
+
+	wg.Wait()
+	fmt.Println("done")
+
+	return nil
+}
+
+func dumpSamplesPostgresWorker(id int, jobs <-chan string, db *tsdb.DBReadOnly, cfg *dumpConfiguration, wg *sync.WaitGroup) (err error) {
+	for j := range jobs {
+		fmt.Println("worker", id, "started  job", j)
+		cfg.labelName = "__name__"
+		cfg.labelValue = j
+		dumpSamplesPostgresIndividual(db, cfg)
+		fmt.Println("worker", id, "finished job", j)
+		wg.Done()
+	}
+	return nil
+}
+
+func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require", cfg.host, cfg.port,
 		cfg.user, cfg.password, cfg.dbname)
 	dbPsql, err := sql.Open("postgres", psqlInfo)
