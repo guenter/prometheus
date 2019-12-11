@@ -33,7 +33,7 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -76,7 +76,7 @@ func execute() (err error) {
 		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
 		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
 		dumpLabelName        = dumpCmd.Flag("label-name", "label name").String()
-		dumpLabelValue       = dumpCmd.Flag("label-value", "label value").String()
+		dumpLabelValue       = dumpCmd.Flag("label-value", "label value").Strings()
 		dumpOutputFile       = dumpCmd.Flag("output-file", "path to sqlite3 db output file").Default("./sqlite3.db").String()
 		dumpPassword         = dumpCmd.Flag("password", "postgres user password").Default("pgpassword").String()
 		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
@@ -642,7 +642,7 @@ type dumpConfiguration struct {
 	format      string
 	host        string
 	labelName   string
-	labelValue  string
+	labelValue  []string
 	maxTime     int64
 	minTime     int64
 	outputFile  string
@@ -673,60 +673,20 @@ func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 }
 
 func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) error {
-	if cfg.all {
-		return dumpSamplesPostgresAll(db, cfg)
-	} else {
-		return dumpSamplesPostgresIndividual(db, cfg)
+	var errStr []string
+	for _, l := range cfg.labelValue {
+		err := dumpSamplesPostgresIndividual(db, cfg, l)
+		if err != nil {
+			fmt.Printf(`Received error "%s" with label %s\n`, err, l)
+			errStr = append(errStr, err.Error())
+		}
 	}
-	return nil
+	err := fmt.Errorf(strings.Join(errStr, "\n"))
+	fmt.Println(err)
+	return err
 }
 
-func dumpSamplesPostgresAll(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
-	q, err := db.Querier(cfg.minTime, cfg.maxTime)
-	if err != nil {
-		return err
-	}
-	defer q.Close()
-
-	existingMetrics, err := q.LabelValues("__name__")
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Found %d metrics\n", len(existingMetrics))
-
-	var wg sync.WaitGroup
-
-	jobs := make(chan string, len(existingMetrics))
-
-	for i := 1; i <= 5; i++ {
-		go dumpSamplesPostgresWorker(i, jobs, db, cfg, &wg)
-	}
-
-	for _, j := range existingMetrics {
-		wg.Add(1)
-		jobs <- j
-	}
-
-	wg.Wait()
-	fmt.Println("done")
-
-	return nil
-}
-
-func dumpSamplesPostgresWorker(id int, jobs <-chan string, db *tsdb.DBReadOnly, cfg *dumpConfiguration, wg *sync.WaitGroup) (err error) {
-	for j := range jobs {
-		fmt.Println("worker", id, "started  job", j)
-		cfg.labelName = "__name__"
-		cfg.labelValue = j
-		dumpSamplesPostgresIndividual(db, cfg)
-		fmt.Println("worker", id, "finished job", j)
-		wg.Done()
-	}
-	return nil
-}
-
-func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
+func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration, lv string) (err error) {
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require", cfg.host, cfg.port,
 		cfg.user, cfg.password, cfg.dbname)
 	dbPsql, err := sql.Open("postgres", psqlInfo)
@@ -734,22 +694,10 @@ func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration) 
 		return err
 	}
 	defer dbPsql.Close()
-
 	tx, err := dbPsql.Begin()
 	if err != nil {
 		return fmt.Errorf("error beginning transaction: %v", err)
 	}
-	stmt, err := tx.Prepare("INSERT INTO labels(cluster_name, labels) values($1, $2::jsonb) ON CONFLICT (cluster_name, labels) DO NOTHING")
-	if err != nil {
-		return fmt.Errorf("error preparing labels statement: %v", err)
-	}
-	defer stmt.Close()
-
-	stmtData, err := tx.Prepare("INSERT INTO data(label_id, timestamp, value) values((SELECT id FROM labels WHERE labels = $1), to_timestamp($2::double precision / 1000), $3);")
-	if err != nil {
-		return fmt.Errorf("error preparing data statement: %v", err)
-	}
-	defer stmtData.Close()
 
 	q, err := db.Querier(cfg.minTime, cfg.maxTime)
 	if err != nil {
@@ -761,51 +709,70 @@ func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration) 
 		merr.Add(q.Close())
 		err = merr.Err()
 	}()
-
 	var matcher labels.Matcher
-	if cfg.labelName != "" && cfg.labelValue != "" {
-		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
-	} else {
-		matcher = labels.NewMustRegexpMatcher("", ".*")
+	if cfg.labelName != "" && lv != "" {
+		matcher = labels.NewEqualMatcher(cfg.labelName, lv)
 	}
 
 	ss, err := q.Select(matcher)
 	if err != nil {
 		return err
 	}
-
 	for ss.Next() {
-		series := ss.At()
-		labels := series.Labels()
-		labelMap := labels.Map()
+		labelMap := ss.At().Labels().Map()
 		jLabel, err := json.Marshal(labelMap)
 		if err != nil {
 			return fmt.Errorf("error marshalling label map: %v", err)
 		}
-		it := series.Iterator()
+		var labelId int
+		err = tx.QueryRow("INSERT INTO labels (cluster_name, labels) VALUES ($1, $2::jsonb) RETURNING id", cfg.clusterName, jLabel).Scan(&labelId)
+		if err != nil {
+			return fmt.Errorf("error inserting into labels table: %v", err)
+		} else {
+			fmt.Printf("inserted new labels with id %d for %s\n", labelId, jLabel)
+		}
+		stmtCopyIn, err := tx.Prepare(pq.CopyIn("data", "label_id", "timestamp", "value"))
+		if err != nil {
+			return fmt.Errorf("error preparing copy statement: %v", err)
+		} else {
+			fmt.Printf("preparing to copy data\n")
+		}
+
+		it := ss.At().Iterator()
 		for it.Next() {
-			ts, val := it.At()
-			_, err := stmt.Exec(cfg.clusterName, jLabel)
+			unixTimeMillis, val := it.At()
+			timestampFormatted := time.Unix(unixTimeMillis/1000, 0).Format(time.RFC3339)
+			_, err = stmtCopyIn.Exec(labelId, timestampFormatted, val)
 			if err != nil {
-				return fmt.Errorf("error inserting into labels table: %v", err)
-			}
-			_, err = stmtData.Exec(jLabel, ts, val)
-			if err != nil {
-				return fmt.Errorf("error inserting into data table: %v", err)
+				return fmt.Errorf("error copying into data table: %v", err)
 			}
 		}
 		if it.Err() != nil {
 			return ss.Err()
 		}
+
+		// This flushes all the buffered data
+		// see https://godoc.org/github.com/lib/pq#hdr-Bulk_imports
+		_, err = stmtCopyIn.Exec()
+		if err != nil {
+			return err
+		} else {
+			fmt.Printf("flushing buffered data\n")
+		}
+		err = stmtCopyIn.Close()
+		if err != nil {
+			return err
+		} else {
+			fmt.Printf("copy completed\n")
+		}
+	}
+	err = tx.Commit()
+	if err != nil {
+		return err
 	}
 
 	if ss.Err() != nil {
 		return ss.Err()
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -824,8 +791,8 @@ func dumpSamplesStdout(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) 
 	}()
 
 	var matcher labels.Matcher
-	if cfg.labelName != "" && cfg.labelValue != "" {
-		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
+	if cfg.labelName != "" && cfg.labelValue != nil {
+		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue[0])
 	} else {
 		matcher = labels.MustNewMatcher(labels.MatchRegexp, "", ".*")
 	}
@@ -916,8 +883,8 @@ func dumpSamplesSqlite3(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error)
 	}()
 
 	var matcher labels.Matcher
-	if cfg.labelName != "" && cfg.labelValue != "" {
-		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue)
+	if cfg.labelName != "" && cfg.labelValue != nil {
+		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue[0])
 	} else {
 		matcher = labels.NewMustRegexpMatcher("", ".*")
 	}
