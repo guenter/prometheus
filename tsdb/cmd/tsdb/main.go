@@ -715,6 +715,10 @@ func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration, 
 	if err != nil {
 		return err
 	}
+	if !ss.Next() {
+		fmt.Printf("found no matches with %s\n", matcher)
+	}
+
 	for ss.Next() {
 		labelMap := ss.At().Labels().Map()
 		jLabel, err := json.Marshal(labelMap)
