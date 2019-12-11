@@ -677,7 +677,7 @@ func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) error {
 	for _, l := range cfg.labelValue {
 		err := dumpSamplesPostgresIndividual(db, cfg, l)
 		if err != nil {
-			error := fmt.Sprintf(`%s with label %s`, err.Error(), l)
+			error := fmt.Sprintf(`%s for metric %s`, err.Error(), l)
 			errStr = append(errStr, error)
 		}
 	}
@@ -727,7 +727,7 @@ func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration, 
 		var labelId int
 		err = tx.QueryRow("INSERT INTO labels (cluster_name, labels) VALUES ($1, $2::jsonb) RETURNING id", cfg.clusterName, jLabel).Scan(&labelId)
 		if err != nil {
-			return fmt.Errorf("error inserting into labels table: %v", err)
+			return fmt.Errorf("error inserting into labels table: %v with label %s", err, jLabel)
 		} else {
 			fmt.Printf("inserted new labels with id %d for %s\n", labelId, jLabel)
 		}
