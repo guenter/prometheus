@@ -677,8 +677,8 @@ func dumpSamplesPostgres(db *tsdb.DBReadOnly, cfg *dumpConfiguration) error {
 	for _, l := range cfg.labelValue {
 		err := dumpSamplesPostgresIndividual(db, cfg, l)
 		if err != nil {
-			fmt.Printf(`Received error "%s" with label %s\n`, err, l)
-			errStr = append(errStr, err.Error())
+			error := fmt.Sprintf(`%s with label %s`, err.Error(), l)
+			errStr = append(errStr, error)
 		}
 	}
 	err := fmt.Errorf(strings.Join(errStr, "\n"))
