@@ -68,7 +68,6 @@ func execute() (err error) {
 		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
-		dumpAll              = dumpCmd.Flag("all", "dump all metrics").Short('a').Bool()
 		dumpClusterName      = dumpCmd.Flag("cluster-name", "name of cluster").Default("N/A").String()
 		dumpDBName           = dumpCmd.Flag("dbname", "postgres database name").Default("tsdb").String()
 		dumpFormat           = dumpCmd.Flag("format", "output format").Default("stdout").String()
@@ -142,7 +141,6 @@ func execute() (err error) {
 		return analyzeBlock(block, *analyzeLimit)
 	case dumpCmd.FullCommand():
 		cfg := &dumpConfiguration{
-			all:         *dumpAll,
 			clusterName: *dumpClusterName,
 			dbname:      *dumpDBName,
 			format:      *dumpFormat,
@@ -636,7 +634,6 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 }
 
 type dumpConfiguration struct {
-	all         bool
 	clusterName string
 	dbname      string
 	format      string
