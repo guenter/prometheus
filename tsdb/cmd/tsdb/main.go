@@ -649,6 +649,16 @@ type dumpConfiguration struct {
 	user        string
 }
 
+func getMatcher(labelName, labelValue string) (*labels.Matcher) {
+	var matcher *labels.Matcher
+	if labelName == "" && labelValue == "" {
+		matcher = labels.MustNewMatcher(labels.MatchRegexp, "", ".*")
+	} else {
+		matcher = labels.MustNewMatcher(labels.MatchEqual, labelName, labelValue)
+	}
+	return matcher
+}
+
 func dumpSamples(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) {
 	switch cfg.format {
 	case "postgres":
@@ -706,11 +716,8 @@ func dumpSamplesPostgresIndividual(db *tsdb.DBReadOnly, cfg *dumpConfiguration, 
 		merr.Add(q.Close())
 		err = merr.Err()
 	}()
-	var matcher labels.Matcher
-	if cfg.labelName != "" && lv != "" {
-		matcher = labels.NewEqualMatcher(cfg.labelName, lv)
-	}
 
+	matcher := getMatcher(cfg.labelName, lv)
 	ss, err := q.Select(matcher)
 	if err != nil {
 		return err
@@ -791,13 +798,8 @@ func dumpSamplesStdout(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error) 
 		err = merr.Err()
 	}()
 
-	var matcher labels.Matcher
-	if cfg.labelName != "" && cfg.labelValue != nil {
-		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue[0])
-	} else {
-		matcher = labels.MustNewMatcher(labels.MatchRegexp, "", ".*")
-	}
-
+	// TODO this doesn't work for multiple values
+	matcher := getMatcher(cfg.labelName, cfg.labelValue[0])
 	ss, err := q.Select(matcher)
 	if err != nil {
 		return err
@@ -883,13 +885,8 @@ func dumpSamplesSqlite3(db *tsdb.DBReadOnly, cfg *dumpConfiguration) (err error)
 		err = merr.Err()
 	}()
 
-	var matcher labels.Matcher
-	if cfg.labelName != "" && cfg.labelValue != nil {
-		matcher = labels.NewEqualMatcher(cfg.labelName, cfg.labelValue[0])
-	} else {
-		matcher = labels.NewMustRegexpMatcher("", ".*")
-	}
-
+	// TODO this doesn't work for multiple values
+	matcher := getMatcher(cfg.labelName, cfg.labelValue[0])
 	ss, err := q.Select(matcher)
 	if err != nil {
 		return err
